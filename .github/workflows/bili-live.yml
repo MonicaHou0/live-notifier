@@ -1,0 +1,118 @@
+name: 炫神直播开播提醒
+
+on:
+  schedule:
+    # 每 5 分钟检查一次（避开整点）
+    - cron: '3-58/5 * * * *'
+  workflow_dispatch:  # 手动运行时只发一条 Bark 测试消息
+
+permissions:
+  contents: write  # 记录上次开播状态，防止重复提醒
+
+concurrency:
+  group: bilibili-live-check
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 获取仓库文件
+        uses: actions/checkout@v4
+
+      - name: 检查直播间并在开播时发通知
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          EVENT_TYPE: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          ROOM_ID = 14709735
+          LIVE_URL = f"https://live.bilibili.com/{ROOM_ID}"
+          STATE_FILE = Path("live_state.json")
+          BARK_KEY = os.environ.get("BARK_KEY", "")
+
+          def get_json(url, payload=None):
+              data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
+              headers = {
+                  "User-Agent": "Mozilla/5.0 (compatible; BiliLiveNotifier/1.0)",
+                  "Accept": "application/json",
+              }
+              if payload:
+                  headers["Content-Type"] = "application/json; charset=utf-8"
+              else:
+                  headers["Referer"] = "https://live.bilibili.com/"
+              request = Request(url, data=data, headers=headers)
+              with urlopen(request, timeout=20) as response:
+                  return json.load(response)
+
+          def notify(title, body):
+              if not BARK_KEY:
+                  raise RuntimeError("找不到 BARK_KEY：请在仓库 Secrets 中添加")
+              response = get_json("https://api.day.app/push", {
+                  "device_key": BARK_KEY,
+                  "title": title,
+                  "body": body,
+                  "group": "B站开播提醒",
+                  "url": LIVE_URL,
+              })
+              if response.get("code") != 200:
+                  raise RuntimeError(f"Bark 推送失败：{response}")
+              print("Bark 推送成功")
+
+          if os.environ.get("EVENT_TYPE") == "workflow_dispatch":
+              notify("✅ 开播提醒测试成功", "Bark 通知已连接！以后炫神开播，就会提醒你。")
+          else:
+              # 主接口失败时尝试备用接口；两者都失败则报错，不误判为下播。
+              endpoints = [
+                  f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={ROOM_ID}",
+                  f"https://api.live.bilibili.com/room/v1/Room/room_init?id={ROOM_ID}",
+              ]
+              errors = []
+              info = None
+              for endpoint in endpoints:
+                  try:
+                      result = get_json(endpoint)
+                      if result.get("code") != 0 or not isinstance(result.get("data"), dict):
+                          raise ValueError(f"B站接口返回异常: code={result.get('code')}")
+                      candidate = result["data"]
+                      if candidate.get("live_status") not in (0, 1, 2):
+                          raise ValueError("没有获得有效直播状态")
+                      info = candidate
+                      break
+                  except Exception as exc:
+                      errors.append(f"{type(exc).__name__}: {exc}")
+              if info is None:
+                  raise RuntimeError("无法查询B站直播状态。" + "; ".join(errors))
+
+              current = 1 if info["live_status"] == 1 else 0
+              previous = json.loads(STATE_FILE.read_text("utf-8")) if STATE_FILE.exists() else {}
+              was_live = previous.get("status") == 1
+              print(f"直播状态: {'直播中' if current else '未开播'}；上次状态: {previous.get('status', '未知')}")
+
+              # 仅从未直播变成直播时通知（首次监测到直播也会通知）。
+              if current == 1 and not was_live:
+                  title = info.get("title") or "点击进入直播间"
+                  notify("🔴 炫神开播啦！", str(title))
+
+              if previous.get("status") != current:
+                  STATE_FILE.write_text(
+                      json.dumps({"status": current}, ensure_ascii=False) + "\n",
+                      encoding="utf-8",
+                  )
+          PY
+
+      - name: 保存直播状态（仅定时运行）
+        if: github.event_name == 'schedule'
+        run: |
+          if [ -n "$(git status --porcelain -- live_state.json)" ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add live_state.json
+            git commit -m 'Update live state [skip ci]'
+            git push
+          fi
