@@ -1,29 +1,5 @@
-name: 炫神直播开播提醒
-
-on:
-  schedule:
-    # 每 5 分钟检查一次（避开整点）
-    - cron: '3-58/5 * * * *'
-  workflow_dispatch:  # 手动运行时只发一条 Bark 测试消息
-
-permissions:
-  contents: write  # 记录上次开播状态，防止重复提醒
-
-concurrency:
-  group: bilibili-live-check
-  cancel-in-progress: false
-
-jobs:
-  monitor:
-    runs-on: ubuntu-latest
-    steps:
-      - name: 获取仓库文件
-        uses: actions/checkout@v4
-
-      - name: 检查直播间并在开播时发通知
-        env:
           BARK_KEY: ${{ secrets.BARK_KEY }}
-          EVENT_TYPE: ${{ github.event_name }}
+          CHECK_MODE: ${{ inputs.mode || 'check' }}
         run: |
           python3 - <<'PY'
           import json
@@ -31,83 +7,100 @@ jobs:
           from pathlib import Path
           from urllib.request import Request, urlopen
 
-          ROOM_ID = 14709735
-          LIVE_URL = f"https://live.bilibili.com/{ROOM_ID}"
-          STATE_FILE = Path("live_state.json")
-          BARK_KEY = os.environ.get("BARK_KEY", "")
+          SHORT_ROOM_ID = 84074
+          LONG_ROOM_ID = 14709735
+          LIVE_URL = f"https://live.bilibili.com/{SHORT_ROOM_ID}"
+          STATE_FILE = Path('live_state.json')
+          BARK_KEY = os.environ.get('BARK_KEY', '')
 
           def get_json(url, payload=None):
-              data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
+              data = json.dumps(payload, ensure_ascii=False).encode('utf-8') if payload is not None else None
               headers = {
-                  "User-Agent": "Mozilla/5.0 (compatible; BiliLiveNotifier/1.0)",
-                  "Accept": "application/json",
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36',
+                  'Accept': 'application/json',
               }
-              if payload:
-                  headers["Content-Type"] = "application/json; charset=utf-8"
+              if data is None:
+                  headers['Referer'] = f'https://live.bilibili.com/{SHORT_ROOM_ID}'
               else:
-                  headers["Referer"] = "https://live.bilibili.com/"
-              request = Request(url, data=data, headers=headers)
-              with urlopen(request, timeout=20) as response:
+                  headers['Content-Type'] = 'application/json; charset=utf-8'
+              with urlopen(Request(url, data=data, headers=headers), timeout=20) as response:
                   return json.load(response)
 
           def notify(title, body):
               if not BARK_KEY:
-                  raise RuntimeError("找不到 BARK_KEY：请在仓库 Secrets 中添加")
-              response = get_json("https://api.day.app/push", {
-                  "device_key": BARK_KEY,
-                  "title": title,
-                  "body": body,
-                  "group": "B站开播提醒",
-                  "url": LIVE_URL,
+                  raise RuntimeError('没有找到 BARK_KEY，请检查 GitHub Secrets')
+              result = get_json('https://api.day.app/push', {
+                  'device_key': BARK_KEY,
+                  'title': title,
+                  'body': body,
+                  'group': 'B站开播提醒',
+                  'url': LIVE_URL,
               })
-              if response.get("code") != 200:
-                  raise RuntimeError(f"Bark 推送失败：{response}")
-              print("Bark 推送成功")
+              if result.get('code') != 200:
+                  raise RuntimeError(f'Bark 推送失败：{result}')
+              print('✅ Bark 推送成功')
 
-          if os.environ.get("EVENT_TYPE") == "workflow_dispatch":
-              notify("✅ 开播提醒测试成功", "Bark 通知已连接！以后炫神开播，就会提醒你。")
+          if os.environ.get('CHECK_MODE') == 'bark_test':
+              notify('✅ Bark 测试通知', 'Bark 推送链路正常。这条消息不代表开播。')
           else:
-              # 主接口失败时尝试备用接口；两者都失败则报错，不误判为下播。
-              endpoints = [
-                  f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={ROOM_ID}",
-                  f"https://api.live.bilibili.com/room/v1/Room/room_init?id={ROOM_ID}",
+              # 两种房间号 + 两种 B 站接口；优先用含 live_time 的 room_init。
+              urls = [
+                  f'https://api.live.bilibili.com/room/v1/Room/room_init?id={SHORT_ROOM_ID}',
+                  f'https://api.live.bilibili.com/room/v1/Room/room_init?id={LONG_ROOM_ID}',
+                  f'https://api.live.bilibili.com/room/v1/Room/get_info?room_id={SHORT_ROOM_ID}',
               ]
-              errors = []
               info = None
-              for endpoint in endpoints:
+              errors = []
+              for url in urls:
                   try:
-                      result = get_json(endpoint)
-                      if result.get("code") != 0 or not isinstance(result.get("data"), dict):
-                          raise ValueError(f"B站接口返回异常: code={result.get('code')}")
-                      candidate = result["data"]
-                      if candidate.get("live_status") not in (0, 1, 2):
-                          raise ValueError("没有获得有效直播状态")
+                      response = get_json(url)
+                      if response.get('code') != 0 or not isinstance(response.get('data'), dict):
+                          raise ValueError(f"code={response.get('code')}, message={response.get('message')}")
+                      candidate = response['data']
+                      if candidate.get('live_status') not in (0, 1, 2):
+                          raise ValueError('接口没有返回有效的 live_status')
+                      # 防止接口返回其他直播间的信息。
+                      ids = {candidate.get('room_id'), candidate.get('short_id')}
+                      if not ids.intersection({SHORT_ROOM_ID, LONG_ROOM_ID}):
+                          raise ValueError(f'返回了意外的直播间：{ids}')
                       info = candidate
+                      print('✅ B站接口访问成功')
+                      print(f"房间号: {candidate.get('room_id')}; 短号: {candidate.get('short_id')}")
                       break
                   except Exception as exc:
-                      errors.append(f"{type(exc).__name__}: {exc}")
+                      errors.append(f'{type(exc).__name__}: {exc}')
+                      print(f'⚠️ 一个B站查询接口失败: {type(exc).__name__}: {exc}')
               if info is None:
-                  raise RuntimeError("无法查询B站直播状态。" + "; ".join(errors))
+                  raise RuntimeError('全部B站接口查询失败：' + '; '.join(errors))
 
-              current = 1 if info["live_status"] == 1 else 0
-              previous = json.loads(STATE_FILE.read_text("utf-8")) if STATE_FILE.exists() else {}
-              was_live = previous.get("status") == 1
-              print(f"直播状态: {'直播中' if current else '未开播'}；上次状态: {previous.get('status', '未知')}")
+              live = (info['live_status'] == 1)
+              raw_time = info.get('live_time')
+              # 直播开始时间用作本次直播 ID，防止漏掉短暂下播后再次开播。
+              live_time = str(raw_time) if live and raw_time not in (None, '', 0, '0', -62170012800) else None
+              previous = json.loads(STATE_FILE.read_text(encoding='utf-8')) if STATE_FILE.exists() else {}
+              old_live = previous.get('status') == 1
+              old_time = previous.get('live_time')
+              print(f"直播状态: {'直播中' if live else '未开播/轮播'}; 本次开播时间: {live_time or '未知'}")
+              print(f"上次记录: status={previous.get('status', '无')}, live_time={old_time or '无'}")
 
-              # 仅从未直播变成直播时通知（首次监测到直播也会通知）。
-              if current == 1 and not was_live:
-                  title = info.get("title") or "点击进入直播间"
-                  notify("🔴 炫神开播啦！", str(title))
+              is_new_session = live and (
+                  not old_live or (live_time is not None and old_time != live_time)
+              )
+              if is_new_session:
+                  notify('🔴 炫神开播啦！', '检测到炫神正在直播，点击进入直播间！')
+              elif live:
+                  print('ℹ️ 已经提醒过同一场直播，不重复发送')
+              else:
+                  print('ℹ️ 当前未开播，不发送提醒')
 
-              if previous.get("status") != current:
-                  STATE_FILE.write_text(
-                      json.dumps({"status": current}, ensure_ascii=False) + "\n",
-                      encoding="utf-8",
-                  )
+              new_state = {'status': 1 if live else 0, 'live_time': live_time if live else None}
+              if new_state != previous:
+                  STATE_FILE.write_text(json.dumps(new_state, ensure_ascii=False) + '\n', encoding='utf-8')
+                  print('✅ 已更新直播状态文件')
           PY
 
-      - name: 保存直播状态（仅定时运行）
-        if: github.event_name == 'schedule'
+      - name: 保存直播状态
+        if: ${{ inputs.mode != 'bark_test' }}
         run: |
           if [ -n "$(git status --porcelain -- live_state.json)" ]; then
             git config user.name 'github-actions[bot]'
