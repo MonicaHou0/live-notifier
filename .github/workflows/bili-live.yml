@@ -1,3 +1,35 @@
+name: 炫神直播开播提醒
+
+on:
+  schedule:
+    - cron: '3-58/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'check=真实检查直播状态；bark_test=只测试通知'
+        required: true
+        default: check
+        type: choice
+        options:
+          - check
+          - bark_test
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bilibili-live-check
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 获取仓库文件
+        uses: actions/checkout@v4
+
+      - name: 查询直播并发送 Bark 通知
+        env:
           BARK_KEY: ${{ secrets.BARK_KEY }}
           CHECK_MODE: ${{ inputs.mode || 'check' }}
         run: |
